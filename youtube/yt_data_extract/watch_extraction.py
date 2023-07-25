@@ -133,32 +133,51 @@ def _extract_from_video_information_renderer(renderer_content):
     return info
 
 def _extract_likes_dislikes(renderer_content):
-    info = {
-        'like_count': None,
-        'dislike_count': None,
-    }
-    for button in renderer_content.get('buttons', ()):
-        button_renderer = button.get('slimMetadataToggleButtonRenderer', {})
-
+    def extract_button_count(toggle_button_renderer):
         # all the digits can be found in the accessibility data
-        count = extract_int(deep_get(
-                    button_renderer,
-                    'button', 'toggleButtonRenderer', 'defaultText',
-                    'accessibility', 'accessibilityData', 'label'))
+        count = extract_int(multi_deep_get(
+            toggle_button_renderer,
+            ['defaultText', 'accessibility', 'accessibilityData', 'label'],
+            ['accessibility', 'label'],
+            ['accessibilityData', 'accessibilityData', 'label'],
+        ))
 
         # this count doesn't have all the digits, it's like 53K for instance
         dumb_count = extract_int(extract_str(deep_get(
-            button_renderer, 'button', 'toggleButtonRenderer', 'defaultText')))
+            toggle_button_renderer, 'defaultText')))
 
         # The accessibility text will be "No likes" or "No dislikes" or
         # something like that, but dumb count will be 0
         if dumb_count == 0:
             count = 0
+        return count
 
-        if 'isLike' in button_renderer:
-            info['like_count'] = count
-        elif 'isDislike' in button_renderer:
-            info['dislike_count'] = count
+    info = {
+        'like_count': None,
+        'dislike_count': None,
+    }
+    for button in renderer_content.get('buttons', ()):
+        if 'slimMetadataToggleButtonRenderer' in button:
+            button_renderer = button['slimMetadataToggleButtonRenderer']
+            count = extract_button_count(deep_get(button_renderer,
+                                                  'button',
+                                                  'toggleButtonRenderer'))
+            if 'isLike' in button_renderer:
+                info['like_count'] = count
+            elif 'isDislike' in button_renderer:
+                info['dislike_count'] = count
+        elif 'slimMetadataButtonRenderer' in button:
+            button_renderer = button['slimMetadataButtonRenderer']
+            liberal_update(info, 'like_count', extract_button_count(deep_get(
+                button_renderer, 'button',
+                'segmentedLikeDislikeButtonRenderer',
+                'likeButton', 'toggleButtonRenderer'
+            )))
+            liberal_update(info, 'dislike_count',extract_button_count(deep_get(
+                button_renderer, 'button',
+                'segmentedLikeDislikeButtonRenderer',
+                'dislikeButton', 'toggleButtonRenderer'
+            )))
     return info
 
 def _extract_from_owner_renderer(renderer_content):
@@ -212,6 +231,36 @@ def _extract_metadata_row_info(renderer_content):
 
     return info
 
+def _extract_from_music_renderer(renderer_content):
+    # latest format for the music list
+    info = {
+        'music_list': [],
+    }
+
+    for carousel in renderer_content.get('carouselLockups', []):
+        song = {}
+        carousel = carousel.get('carouselLockupRenderer', {})
+        video_renderer = carousel.get('videoLockup', {})
+        video_renderer_info = extract_item_info(video_renderer)
+        video_id = video_renderer_info.get('id')
+        song['url'] = concat_or_none('https://www.youtube.com/watch?v=',
+                                     video_id)
+        song['title'] = video_renderer_info.get('title')
+        for row in carousel.get('infoRows', []):
+            row = row.get('infoRowRenderer', {})
+            title = extract_str(row.get('title'))
+            data = extract_str(row.get('defaultMetadata'))
+            if title == 'SONG':
+                song['title'] = data
+            elif title == 'ARTIST':
+                song['artist'] = data
+            elif title == 'ALBUM':
+                song['album'] = data
+            elif title == 'WRITERS':
+                song['writers'] = data
+        info['music_list'].append(song)
+    return info
+
 def _extract_from_video_metadata(renderer_content):
     info = _extract_from_video_information_renderer(renderer_content)
     liberal_dict_update(info, _extract_likes_dislikes(renderer_content))
@@ -235,6 +284,7 @@ visible_extraction_dispatch = {
     'slimVideoActionBarRenderer': _extract_likes_dislikes,
     'slimOwnerRenderer': _extract_from_owner_renderer,
     'videoDescriptionHeaderRenderer': _extract_from_video_header_renderer,
+    'videoDescriptionMusicSectionRenderer': _extract_from_music_renderer,
     'expandableVideoDescriptionRenderer': _extract_from_description_renderer,
     'metadataRowContainerRenderer': _extract_metadata_row_info,
     # OR just this one, which contains SOME of the above inside it
@@ -369,26 +419,28 @@ def _extract_watch_info_desktop(top_level):
     return info
 
 def update_format_with_codec_info(fmt, codec):
-    if (codec.startswith('av')
-            or codec in ('vp9', 'vp8', 'vp8.0', 'h263', 'h264', 'mp4v')):
+    if any(codec.startswith(c) for c in ('av', 'vp', 'h263', 'h264', 'mp4v')):
         if codec == 'vp8.0':
             codec = 'vp8'
         conservative_update(fmt, 'vcodec', codec)
     elif (codec.startswith('mp4a')
-            or codec in ('opus', 'mp3', 'aac', 'dtse', 'ec-3', 'vorbis')):
+            or codec in ('opus', 'mp3', 'aac', 'dtse', 'ec-3', 'vorbis',
+                        'ac-3')):
         conservative_update(fmt, 'acodec', codec)
     else:
         print('Warning: unrecognized codec: ' + codec)
 
 fmt_type_re = re.compile(
-    r'(text|audio|video)/([\w0-9]+); codecs="([\w0-9\.]+(?:, [\w0-9\.]+)*)"')
+    r'(text|audio|video)/([\w0-9]+); codecs="([^"]+)"')
 def update_format_with_type_info(fmt, yt_fmt):
     # 'type' for invidious api format
     mime_type = multi_get(yt_fmt, 'mimeType', 'type')
     if mime_type is None:
         return
     match = re.fullmatch(fmt_type_re, mime_type)
-
+    if match is None:
+        print('Warning: Could not read mimetype', mime_type)
+        return
     type, fmt['ext'], codecs = match.groups()
     codecs = codecs.split(', ')
     for codec in codecs:
@@ -410,6 +462,13 @@ def _extract_formats(info, player_response):
 
     for yt_fmt in yt_formats:
         itag = yt_fmt.get('itag')
+
+        # Translated audio track
+        # Example: https://www.youtube.com/watch?v=gF9kkB0UWYQ
+        # Only get the original language for now so a foreign
+        # translation will not be picked just because it comes first
+        if deep_get(yt_fmt, 'audioTrack', 'audioIsDefault') is False:
+            continue
 
         fmt = {}
         fmt['itag'] = itag
@@ -771,7 +830,7 @@ def get_caption_url(info, language, format, automatic=False, translation_languag
         url += '&tlang=' + translation_language
     return url
 
-def update_with_age_restricted_info(info, player_response):
+def update_with_new_urls(info, player_response):
     '''Inserts urls from player_response json'''
     ERROR_PREFIX = 'Error getting missing player or bypassing age-restriction: '
 

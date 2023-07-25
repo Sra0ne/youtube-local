@@ -31,6 +31,98 @@ headers_mobile = (
 real_cookie = (('Cookie', 'VISITOR_INFO1_LIVE=8XihrAcN1l4'),)
 generic_cookie = (('Cookie', 'VISITOR_INFO1_LIVE=ST1Ti53r4fU'),)
 
+# added an extra nesting under the 2nd base64 compared to v4
+# added tab support
+# changed offset field to uint id 1
+def channel_ctoken_v5(channel_id, page, sort, tab, view=1):
+    new_sort = (2 if int(sort) == 1 else 1)
+    offset = 30*(int(page) - 1)
+    if tab == 'videos':
+        tab = 15
+    elif tab == 'shorts':
+        tab = 10
+    elif tab == 'streams':
+        tab = 14
+    pointless_nest = proto.string(80226972,
+        proto.string(2, channel_id)
+        + proto.string(3,
+            proto.percent_b64encode(
+                proto.string(110,
+                    proto.string(3,
+                        proto.string(tab,
+                            proto.string(1,
+                                proto.string(1,
+                                    proto.unpadded_b64encode(
+                                        proto.string(1,
+                                        proto.string(1,
+                                            proto.unpadded_b64encode(
+                                                proto.string(2,
+                                                    b"ST:"
+                                                    + proto.unpadded_b64encode(
+                                                        proto.uint(1, offset)
+                                                    )
+                                                )
+                                            )
+                                        )
+                                        )
+                                    )
+                                )
+                                 # targetId, just needs to be present but
+                                 # doesn't need to be correct
+                                + proto.string(2, "63faaff0-0000-23fe-80f0-582429d11c38")
+                            )
+                            # 1 - newest, 2 - popular
+                            + proto.uint(3, new_sort)
+                        )
+                    )
+                )
+            )
+        )
+    )
+
+    return base64.urlsafe_b64encode(pointless_nest).decode('ascii')
+
+# https://github.com/user234683/youtube-local/issues/151
+def channel_ctoken_v4(channel_id, page, sort, tab, view=1):
+    new_sort = (2 if int(sort) == 1 else 1)
+    offset = str(30*(int(page) - 1))
+    pointless_nest = proto.string(80226972,
+        proto.string(2, channel_id)
+        + proto.string(3,
+            proto.percent_b64encode(
+                proto.string(110,
+                    proto.string(3,
+                        proto.string(15,
+                            proto.string(1,
+                                proto.string(1,
+                                    proto.unpadded_b64encode(
+                                        proto.string(1,
+                                            proto.unpadded_b64encode(
+                                                proto.string(2,
+                                                    b"ST:"
+                                                    + proto.unpadded_b64encode(
+                                                        proto.string(2, offset)
+                                                    )
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                                 # targetId, just needs to be present but
+                                 # doesn't need to be correct
+                                + proto.string(2, "63faaff0-0000-23fe-80f0-582429d11c38")
+                            )
+                            # 1 - newest, 2 - popular
+                            + proto.uint(3, new_sort)
+                        )
+                    )
+                )
+            )
+        )
+    )
+
+    return base64.urlsafe_b64encode(pointless_nest).decode('ascii')
+
 # SORT:
 # videos:
 #    Popular - 1
@@ -114,7 +206,10 @@ def get_channel_tab(channel_id, page="1", sort=3, tab='videos', view=1,
     message = 'Got channel tab' if print_status else None
 
     if not ctoken:
-        ctoken = channel_ctoken_v3(channel_id, page, sort, tab, view)
+        if tab in ('videos', 'shorts', 'streams'):
+            ctoken = channel_ctoken_v5(channel_id, page, sort, tab, view)
+        else:
+            ctoken = channel_ctoken_v3(channel_id, page, sort, tab, view)
         ctoken = ctoken.replace('=', '%3D')
 
     # Not sure what the purpose of the key is or whether it will change
@@ -182,6 +277,30 @@ def get_channel_id(base_url):
         return match.group(1)
     return None
 
+metadata_cache = cachetools.LRUCache(128)
+@cachetools.cached(metadata_cache)
+def get_metadata(channel_id):
+    base_url = 'https://www.youtube.com/channel/' + channel_id
+    polymer_json = util.fetch_url(base_url + '/about?pbj=1',
+                                  headers_desktop,
+                                  debug_name='gen_channel_about',
+                                  report_text='Retrieved channel metadata')
+    info = yt_data_extract.extract_channel_info(json.loads(polymer_json),
+                                                'about',
+                                                continuation=False)
+    return extract_metadata_for_caching(info)
+def set_cached_metadata(channel_id, metadata):
+    @cachetools.cached(metadata_cache)
+    def dummy_func_using_same_cache(channel_id):
+        return metadata
+    dummy_func_using_same_cache(channel_id)
+def extract_metadata_for_caching(channel_info):
+    metadata = {}
+    for key in ('approx_subscriber_count', 'short_description', 'channel_name',
+                'avatar'):
+        metadata[key] = channel_info[key]
+    return metadata
+
 def get_number_of_videos_general(base_url):
     return get_number_of_videos_channel(get_channel_id(base_url))
 
@@ -227,11 +346,11 @@ def post_process_channel_info(info):
                 info['links'][i] = (text, util.prefix_url(url))
 
 
-def get_channel_first_page(base_url=None, channel_id=None):
+def get_channel_first_page(base_url=None, channel_id=None, tab='videos'):
     if channel_id:
         base_url = 'https://www.youtube.com/channel/' + channel_id
-    return util.fetch_url(base_url + '/videos?pbj=1&view=0', headers_desktop,
-                          debug_name='gen_channel_videos')
+    return util.fetch_url(base_url + '/' + tab + '?pbj=1&view=0',
+                          headers_desktop, debug_name='gen_channel_' + tab)
 
 
 playlist_sort_codes = {'2': "da", '3': "dd", '4': "lad"}
@@ -248,24 +367,27 @@ def get_channel_page_general_url(base_url, tab, request, channel_id=None):
     query = request.args.get('query', '')
     ctoken = request.args.get('ctoken', '')
     default_params = (page_number == 1 and sort == '3' and view == '1')
+    continuation = bool(ctoken) # whether or not we're using a continuation
 
-    if tab == 'videos' and channel_id and not default_params:
+    if (tab in ('videos', 'shorts', 'streams') and channel_id and
+        not default_params):
         tasks = (
             gevent.spawn(get_number_of_videos_channel, channel_id),
             gevent.spawn(get_channel_tab, channel_id, page_number, sort,
-                         'videos', view, ctoken)
+                         tab, view, ctoken)
         )
         gevent.joinall(tasks)
         util.check_gevent_exceptions(*tasks)
         number_of_videos, polymer_json = tasks[0].value, tasks[1].value
-    elif tab == 'videos':
+        continuation = True
+    elif tab in ('videos', 'shorts', 'streams'):
         if channel_id:
             num_videos_call = (get_number_of_videos_channel, channel_id)
         else:
             num_videos_call = (get_number_of_videos_general, base_url)
         tasks = (
             gevent.spawn(*num_videos_call),
-            gevent.spawn(get_channel_first_page, base_url=base_url),
+            gevent.spawn(get_channel_first_page, base_url=base_url, tab=tab),
         )
         gevent.joinall(tasks)
         util.check_gevent_exceptions(*tasks)
@@ -277,6 +399,7 @@ def get_channel_page_general_url(base_url, tab, request, channel_id=None):
     elif tab == 'playlists':
         polymer_json = get_channel_tab(channel_id, page_number, sort,
                                        'playlists', view)
+        continuation = True
     elif tab == 'search' and channel_id:
         polymer_json = get_channel_search_json(channel_id, query, page_number)
     elif tab == 'search':
@@ -286,16 +409,40 @@ def get_channel_page_general_url(base_url, tab, request, channel_id=None):
         flask.abort(404, 'Unknown channel tab: ' + tab)
 
 
-    info = yt_data_extract.extract_channel_info(json.loads(polymer_json), tab)
+    info = yt_data_extract.extract_channel_info(json.loads(polymer_json), tab,
+                                                continuation=continuation)
+    if channel_id:
+        info['channel_url'] = 'https://www.youtube.com/channel/' + channel_id
+        info['channel_id'] = channel_id
+    else:
+        channel_id = info['channel_id']
+
+    # Will have microformat present, cache metadata while we have it
+    if channel_id and default_params:
+        metadata = extract_metadata_for_caching(info)
+        set_cached_metadata(channel_id, metadata)
+    # Otherwise, populate with our (hopefully cached) metadata
+    elif channel_id and info['channel_name'] is None:
+        metadata = get_metadata(channel_id)
+        for key, value in metadata.items():
+            yt_data_extract.conservative_update(info, key, value)
+        # need to add this metadata to the videos/playlists
+        additional_info = {
+            'author': info['channel_name'],
+            'author_id': info['channel_id'],
+            'author_url': info['channel_url'],
+        }
+        for item in info['items']:
+            item.update(additional_info)
+
     if info['error'] is not None:
         return flask.render_template('error.html', error_message = info['error'])
 
-    post_process_channel_info(info)
-    if tab == 'videos':
+    if tab in ('videos', 'shorts', 'streams'):
         info['number_of_videos'] = number_of_videos
         info['number_of_pages'] = math.ceil(number_of_videos/30)
         info['header_playlist_names'] = local_playlist.get_playlist_names()
-    if tab in ('videos', 'playlists'):
+    if tab in ('videos', 'shorts', 'streams', 'playlists'):
         info['current_sort'] = sort
     elif tab == 'search':
         info['search_box_value'] = query
@@ -303,6 +450,8 @@ def get_channel_page_general_url(base_url, tab, request, channel_id=None):
     if tab in ('search', 'playlists'):
         info['page_number'] = page_number
     info['subscribed'] = subscriptions.is_subscribed(info['channel_id'])
+
+    post_process_channel_info(info)
 
     return flask.render_template('channel.html',
         parameters_dictionary = request.args,
